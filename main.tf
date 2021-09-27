@@ -17,16 +17,16 @@ provider "aws" {
 ## Route 53
 # Provides details about the zone
 data "aws_route53_zone" "main" {
-  name         = var.website-domain-main
+  name         = "${try(var.website-domain-zone, var.website-domain-main)}."
   private_zone = false
 }
 
 ## ACM (AWS Certificate Manager)
-# Creates the wildcard certificate *.<yourdomain.com>
-resource "aws_acm_certificate" "wildcard_website" {
+# Creates the certificate <yourdomain.com> with optional wildcard
+resource "aws_acm_certificate" "main" {
   provider                  = aws.us-east-1
   domain_name               = var.website-domain-main
-  subject_alternative_names = ["*.${var.website-domain-main}"]
+  subject_alternative_names = var.create-wildcard-certificate ? ["*.${var.website-domain-main}"] : []
   validation_method         = "DNS"
 
   tags = merge(var.tags, {
@@ -41,9 +41,9 @@ resource "aws_acm_certificate" "wildcard_website" {
 }
 
 # Validates the ACM wildcard by creating a Route53 record (as `validation_method` is set to `DNS` in the aws_acm_certificate resource)
-resource "aws_route53_record" "wildcard_validation" {
+resource "aws_route53_record" "certificate_validation" {
   for_each = {
-    for dvo in aws_acm_certificate.wildcard_website.domain_validation_options : dvo.domain_name => {
+    for dvo in aws_acm_certificate.main.domain_validation_options : dvo.domain_name => {
       name   = dvo.resource_record_name
       record = dvo.resource_record_value
       type   = dvo.resource_record_type
@@ -58,21 +58,21 @@ resource "aws_route53_record" "wildcard_validation" {
 }
 
 # Triggers the ACM wildcard certificate validation event
-resource "aws_acm_certificate_validation" "wildcard_cert" {
+resource "aws_acm_certificate_validation" "main" {
   provider                = aws.us-east-1
-  certificate_arn         = aws_acm_certificate.wildcard_website.arn
-  validation_record_fqdns = [for k, v in aws_route53_record.wildcard_validation : v.fqdn]
+  certificate_arn         = aws_acm_certificate.main.arn
+  validation_record_fqdns = [for k, v in aws_route53_record.certificate_validation : v.fqdn]
 }
 
 
 # Get the ARN of the issued certificate
-data "aws_acm_certificate" "wildcard_website" {
+data "aws_acm_certificate" "main" {
   provider = aws.us-east-1
 
   depends_on = [
-    aws_acm_certificate.wildcard_website,
-    aws_route53_record.wildcard_validation,
-    aws_acm_certificate_validation.wildcard_cert,
+    aws_acm_certificate.main,
+    aws_route53_record.certificate_validation,
+    aws_acm_certificate_validation.main,
   ]
 
   domain      = var.website-domain-main
@@ -130,6 +130,7 @@ resource "aws_s3_bucket" "website_root" {
 
 # Creates bucket for the website handling the redirection (if required), e.g. from https://www.example.com to https://example.com
 resource "aws_s3_bucket" "website_redirect" {
+  count         = var.website-domain-redirect != null ? 1 : 0
   bucket        = "${var.website-domain-main}-redirect"
   acl           = "public-read"
   force_destroy = true
@@ -208,7 +209,7 @@ resource "aws_cloudfront_distribution" "website_cdn_root" {
   }
 
   viewer_certificate {
-    acm_certificate_arn = data.aws_acm_certificate.wildcard_website.arn
+    acm_certificate_arn = data.aws_acm_certificate.main.arn
     ssl_support_method  = "sni-only"
   }
 
@@ -274,14 +275,15 @@ POLICY
 
 # Creates the CloudFront distribution to serve the redirection website (if redirection is required)
 resource "aws_cloudfront_distribution" "website_cdn_redirect" {
+  count       = var.website-domain-redirect != null ? 1 : 0
   enabled     = true
   price_class = "PriceClass_All"
   # Select the correct PriceClass depending on who the CDN is supposed to serve (https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PriceClass.html)
   aliases = [var.website-domain-redirect]
 
   origin {
-    origin_id   = "origin-bucket-${aws_s3_bucket.website_redirect.id}"
-    domain_name = aws_s3_bucket.website_redirect.website_endpoint
+    origin_id   = "origin-bucket-${aws_s3_bucket.website_redirect[count.index].id}"
+    domain_name = aws_s3_bucket.website_redirect[count.index].website_endpoint
 
     custom_origin_config {
       http_port              = 80
@@ -299,7 +301,7 @@ resource "aws_cloudfront_distribution" "website_cdn_redirect" {
   default_cache_behavior {
     allowed_methods  = ["GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "DELETE"]
     cached_methods   = ["GET", "HEAD"]
-    target_origin_id = "origin-bucket-${aws_s3_bucket.website_redirect.id}"
+    target_origin_id = "origin-bucket-${aws_s3_bucket.website_redirect[count.index].id}"
     min_ttl          = "0"
     default_ttl      = "300"
     max_ttl          = "1200"
@@ -322,7 +324,7 @@ resource "aws_cloudfront_distribution" "website_cdn_redirect" {
   }
 
   viewer_certificate {
-    acm_certificate_arn = data.aws_acm_certificate.wildcard_website.arn
+    acm_certificate_arn = data.aws_acm_certificate.main.arn
     ssl_support_method  = "sni-only"
   }
 
@@ -341,13 +343,14 @@ resource "aws_cloudfront_distribution" "website_cdn_redirect" {
 
 # Creates the DNS record to point on the CloudFront distribution ID that handles the redirection website
 resource "aws_route53_record" "website_cdn_redirect_record" {
+  count   = var.website-domain-redirect != null ? 1 : 0
   zone_id = data.aws_route53_zone.main.zone_id
   name    = var.website-domain-redirect
   type    = "A"
 
   alias {
-    name                   = aws_cloudfront_distribution.website_cdn_redirect.domain_name
-    zone_id                = aws_cloudfront_distribution.website_cdn_redirect.hosted_zone_id
+    name                   = aws_cloudfront_distribution.website_cdn_redirect[count.index].domain_name
+    zone_id                = aws_cloudfront_distribution.website_cdn_redirect[count.index].hosted_zone_id
     evaluate_target_health = false
   }
 }
